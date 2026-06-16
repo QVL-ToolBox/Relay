@@ -6,17 +6,20 @@
 //!
 //! Module map (V1):
 //! - [`topic`]   — topic filter matching (`+`, `#`) and shared-subscription parsing.
-//! - [`message`] — the in-flight message model (payload, QoS, retain).
-//! - [`qos`]     — quality-of-service levels.
-//! - [`router`]  — subscription table and topic→subscribers routing.
-//! - `session`   — per-client session state and QoS in-flight tracking *(TODO V1)*.
+//! - [`message`]  — the in-flight message model (payload, QoS, retain).
+//! - [`qos`]      — quality-of-service levels.
+//! - [`router`]   — subscription table and topic→subscribers routing.
+//! - [`retained`] — last-value-per-topic store, replayed to new subscribers.
+//! - `session`    — per-client session state and QoS in-flight tracking *(TODO V1)*.
 
 pub mod message;
 pub mod qos;
+pub mod retained;
 pub mod router;
 pub mod topic;
 
 pub use message::Message;
 pub use qos::QoS;
+pub use retained::RetainedStore;
 pub use router::{ClientId, Router};
 pub use topic::{topic_matches, SharedSubscription, TopicFilter};

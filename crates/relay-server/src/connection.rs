@@ -21,11 +21,11 @@ use std::collections::HashSet;
 use std::num::NonZeroU16;
 
 use futures::{SinkExt, StreamExt};
-use relay_core::{QoS, SharedSubscription, TopicFilter};
+use relay_core::{Message, QoS, SharedSubscription, TopicFilter};
 use rmqtt_codec::types::Publish;
 use rmqtt_codec::v5::{
-    Codec, ConnectAck, ConnectAckReason, Packet, PublishAck, PublishAckReason, PublishProperties,
-    QoS as WireQoS, SubscribeAck, SubscribeAckReason,
+    Codec, ConnectAck, ConnectAckReason, DisconnectReasonCode, Packet, PublishAck,
+    PublishAckReason, PublishProperties, QoS as WireQoS, SubscribeAck, SubscribeAckReason,
 };
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
@@ -120,6 +120,10 @@ pub async fn handle(socket: TcpStream, peer: String, hub: Hub) {
     let (mut sink, mut stream) = Framed::new(socket, Codec::new(MAX_INBOUND_SIZE, 0)).split();
     let mut connected = false;
     let mut qos_state = OutboundQos::new();
+    // The client's Will, published if the connection ends *without* a clean
+    // DISCONNECT (network drop, protocol error, or DISCONNECT-with-Will).
+    let mut will: Option<Message> = None;
+    let mut clean_disconnect = false;
 
     loop {
         tokio::select! {
@@ -135,6 +139,13 @@ pub async fn handle(socket: TcpStream, peer: String, hub: Hub) {
                     Packet::Connect(connect) => {
                         info!(%peer, client_id = %connect.client_id, "CONNECT");
                         connected = true;
+                        // Remember the Will (if any) to publish on abnormal exit.
+                        will = connect.last_will.as_ref().map(|w| Message {
+                            topic: w.topic.to_string(),
+                            payload: w.message.clone(),
+                            qos: wire_to_core(w.qos),
+                            retain: w.retain,
+                        });
                         let ack = ConnectAck {
                             reason_code: ConnectAckReason::Success,
                             ..ConnectAck::default()
@@ -145,6 +156,9 @@ pub async fn handle(socket: TcpStream, peer: String, hub: Hub) {
                     Packet::Subscribe(sub) => {
                         if !connected { warn!(%peer, "SUBSCRIBE before CONNECT, dropping"); break; }
                         let mut status = Vec::with_capacity(sub.topic_filters.len());
+                        // Retained messages matching a fresh subscription are sent
+                        // *after* the SUBACK, marked retained.
+                        let mut retained_to_send: Vec<Delivery> = Vec::new();
                         for (filter, opts) in &sub.topic_filters {
                             // Grant the requested QoS, capped at what we support.
                             let granted = wire_to_core(opts.qos).min(MAX_QOS);
@@ -152,10 +166,19 @@ pub async fn handle(socket: TcpStream, peer: String, hub: Hub) {
                             // (competing consumers); anything else is normal fan-out.
                             if let Some(shared) = SharedSubscription::parse(filter) {
                                 info!(%peer, group = %shared.group, filter = %shared.filter.as_str(), ?granted, "SUBSCRIBE (shared)");
+                                // Retained messages are not replayed to shared subs.
                                 hub.subscribe_shared(shared.group, id, shared.filter, granted);
                                 status.push(granted_reason(granted));
                             } else if let Some(tf) = TopicFilter::parse(filter) {
                                 info!(%peer, %filter, ?granted, "SUBSCRIBE");
+                                for msg in hub.retained_matching(&tf) {
+                                    retained_to_send.push(Delivery {
+                                        topic: msg.topic,
+                                        payload: msg.payload,
+                                        qos: msg.qos.min(granted),
+                                        retain: true,
+                                    });
+                                }
                                 hub.subscribe(id, tf, granted);
                                 status.push(granted_reason(granted));
                             } else {
@@ -170,6 +193,14 @@ pub async fn handle(socket: TcpStream, peer: String, hub: Hub) {
                             status,
                         };
                         if sink.send(Packet::from(ack)).await.is_err() { break; }
+
+                        // Replay retained messages now that the SUBACK is out.
+                        let mut send_failed = false;
+                        for delivery in retained_to_send {
+                            let packet = build_publish(delivery, &mut qos_state);
+                            if sink.send(packet).await.is_err() { send_failed = true; break; }
+                        }
+                        if send_failed { break; }
                     }
 
                     Packet::Publish(p) => {
@@ -212,7 +243,15 @@ pub async fn handle(socket: TcpStream, peer: String, hub: Hub) {
                         if sink.send(Packet::PingResponse).await.is_err() { break; }
                     }
 
-                    Packet::Disconnect(_) => { info!(%peer, "DISCONNECT"); break; }
+                    Packet::Disconnect(d) => {
+                        // A normal DISCONNECT discards the Will; any other reason
+                        // code means "publish my Will" (MQTT 5 §3.14).
+                        if d.reason_code == DisconnectReasonCode::NormalDisconnection {
+                            clean_disconnect = true;
+                        }
+                        info!(%peer, reason = ?d.reason_code, "DISCONNECT");
+                        break;
+                    }
 
                     other => {
                         debug!(%peer, kind = other.packet_type(), "unhandled packet (TODO)");
@@ -230,6 +269,14 @@ pub async fn handle(socket: TcpStream, peer: String, hub: Hub) {
                     None => break, // our sender was dropped (hub deregistered us)
                 }
             }
+        }
+    }
+
+    // Publish the Will unless the client disconnected cleanly.
+    if !clean_disconnect {
+        if let Some(w) = will.take() {
+            info!(%peer, topic = %w.topic, "publishing Will");
+            hub.publish(&w.topic, &w.payload, w.qos, w.retain);
         }
     }
 

@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use relay_core::{ClientId, QoS, Router, TopicFilter};
+use relay_core::{ClientId, Message, QoS, RetainedStore, Router, TopicFilter};
 use tokio::sync::mpsc;
 use tracing::debug;
 
@@ -43,6 +43,7 @@ struct Inner {
     next_id: AtomicU64,
     router: Mutex<Router>,
     clients: Mutex<HashMap<ClientId, mpsc::UnboundedSender<Delivery>>>,
+    retained: Mutex<RetainedStore>,
 }
 
 impl Hub {
@@ -52,6 +53,7 @@ impl Hub {
                 next_id: AtomicU64::new(1),
                 router: Mutex::new(Router::new()),
                 clients: Mutex::new(HashMap::new()),
+                retained: Mutex::new(RetainedStore::new()),
             }),
         }
     }
@@ -85,11 +87,30 @@ impl Hub {
             .subscribe_shared(group, id, filter, qos);
     }
 
+    /// Retained messages whose topic matches `filter`, to replay to a client
+    /// that just subscribed.
+    pub fn retained_matching(&self, filter: &TopicFilter) -> Vec<Message> {
+        self.inner.retained.lock().unwrap().matching(filter)
+    }
+
     /// Deliver a PUBLISH to its recipients: every matching normal subscriber,
     /// plus one member per matching share group (round-robin). Each recipient
     /// gets the message at the effective QoS `min(msg_qos, granted)`.
     /// Returns how many recipients the message was queued for.
+    ///
+    /// If `retain` is set, the message also updates the retained store for
+    /// `topic` (an empty payload clears it) — this happens regardless of whether
+    /// anyone is currently subscribed.
     pub fn publish(&self, topic: &str, payload: &Bytes, msg_qos: QoS, retain: bool) -> usize {
+        if retain {
+            self.inner.retained.lock().unwrap().apply(Message {
+                topic: topic.to_string(),
+                payload: payload.clone(),
+                qos: msg_qos,
+                retain: true,
+            });
+        }
+
         // Resolve targets under the router lock, then release it before sending.
         let targets = self.inner.router.lock().unwrap().route(topic);
         if targets.is_empty() {

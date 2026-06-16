@@ -51,8 +51,9 @@ with `RELAY_CONFIG`.
 - [x] Pub/Sub routing + wildcards: SUBSCRIBE→SUBACK, PUBLISH → matching subscribers (QoS 0 fan-out, verified end-to-end)
 - [x] **Shared subscriptions** (`$share/group/topic`) — competing consumers / round-robin queue (verified end-to-end)
 - [x] **QoS 1** (at-least-once) — PUBACK to publisher + QoS-1 delivery with per-connection packet ids, granted via SUBACK (verified end-to-end)
+- [x] **Retained messages** — last value per topic, replayed to late subscribers (retain flag set), cleared by an empty payload (verified end-to-end)
+- [x] **Will (LWT)** — published on abnormal disconnect, discarded on a clean DISCONNECT (verified end-to-end)
 - [ ] QoS 2 acknowledgement flow (PUBREC / PUBREL / PUBCOMP)
-- [ ] Retained messages + Will (LWT)
 - [ ] Sessions (clean start / session expiry)
 - [ ] WebSocket transport (browser/mobile)
 
