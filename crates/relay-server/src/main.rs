@@ -12,7 +12,8 @@ mod storage;
 mod ws;
 
 use config::Config;
-use hub::Hub;
+use hub::{Hub, RetryConfig};
+use std::time::Duration;
 use storage::Storage;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -55,7 +56,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ws_listener = TcpListener::bind(config.ws_addr).await?;
     info!("relay listening on ws://{}", config.ws_addr);
 
-    let hub = Hub::new(storage);
+    let retry = RetryConfig {
+        max_attempts: config.max_delivery_attempts,
+        base: Duration::from_secs(config.retry_base_secs.max(1)),
+        cap: Duration::from_secs(config.retry_max_secs.max(1)),
+    };
+    let hub = Hub::new(storage, retry);
 
     loop {
         tokio::select! {

@@ -36,6 +36,9 @@ const RETAINED: TableDefinition<&str, &[u8]> = TableDefinition::new("retained");
 const SESSIONS: TableDefinition<&str, u32> = TableDefinition::new("sessions");
 const SUBSCRIPTIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("subscriptions");
 const INFLIGHT: TableDefinition<&str, &[u8]> = TableDefinition::new("inflight");
+/// Dead-lettered messages, keyed by an auto-incrementing sequence (insertion
+/// order) so they can be replayed later. Value is an opaque blob from the hub.
+const DEAD_LETTERS: TableDefinition<u64, &[u8]> = TableDefinition::new("dead_letters");
 
 /// Separator between `client_id` and the raw filter in a subscription key.
 const SEP: char = '\u{0}';
@@ -63,6 +66,7 @@ impl Storage {
         txn.open_table(SESSIONS)?;
         txn.open_table(SUBSCRIPTIONS)?;
         txn.open_table(INFLIGHT)?;
+        txn.open_table(DEAD_LETTERS)?;
         txn.commit()?;
         Ok(Storage { db })
     }
@@ -196,6 +200,23 @@ impl Storage {
             out.insert(key.value().to_string(), value.value().to_vec());
         }
         Ok(out)
+    }
+
+    /// Append a dead-lettered message (opaque blob from the hub), assigning it
+    /// the next sequence number so insertion order — hence replay order — is
+    /// preserved.
+    pub fn append_dead_letter(&self, blob: &[u8]) -> Result<(), redb::Error> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(DEAD_LETTERS)?;
+            let next = match table.last()? {
+                Some((k, _)) => k.value().wrapping_add(1),
+                None => 0,
+            };
+            table.insert(next, blob)?;
+        }
+        txn.commit()?;
+        Ok(())
     }
 
     /// Load every durable session with its subscriptions (called at startup).

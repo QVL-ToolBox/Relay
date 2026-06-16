@@ -16,6 +16,14 @@ pub struct Config {
     /// Directory for the on-disk store. When set, retained messages survive
     /// restarts; when absent, Relay runs fully in-memory (V1 behaviour).
     pub data_dir: Option<PathBuf>,
+    /// Total delivery attempts for an unacknowledged QoS 1/2 message before it is
+    /// dead-lettered (`1` = no retry, straight to DLQ on the first failure).
+    pub max_delivery_attempts: u32,
+    /// Base back-off between redelivery attempts, in seconds (doubles each
+    /// attempt, capped at [`retry_max_secs`](Config::retry_max_secs)).
+    pub retry_base_secs: u64,
+    /// Upper bound on the redelivery back-off, in seconds.
+    pub retry_max_secs: u64,
 }
 
 impl Default for Config {
@@ -25,6 +33,9 @@ impl Default for Config {
             tcp_addr: "0.0.0.0:1883".parse().unwrap(),
             ws_addr: "0.0.0.0:8083".parse().unwrap(),
             data_dir: None,
+            max_delivery_attempts: 5,
+            retry_base_secs: 5,
+            retry_max_secs: 60,
         }
     }
 }

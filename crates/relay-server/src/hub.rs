@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use relay_core::{ClientId, Message, QoS, RetainedStore, Router, SharedSubscription, TopicFilter};
@@ -35,6 +35,36 @@ use crate::storage::Storage;
 
 /// "Never expire" sentinel for the session-expiry interval (MQTT 5).
 const NO_EXPIRY: u32 = u32::MAX;
+
+/// Redelivery / dead-letter policy for unacknowledged QoS 1/2 messages.
+#[derive(Clone, Copy)]
+pub struct RetryConfig {
+    /// Total delivery attempts before dead-lettering (1 = no retry).
+    pub max_attempts: u32,
+    /// Base back-off; doubles each attempt, capped at `cap`.
+    pub base: Duration,
+    /// Upper bound on the back-off.
+    pub cap: Duration,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        RetryConfig { max_attempts: 5, base: Duration::from_secs(5), cap: Duration::from_secs(60) }
+    }
+}
+
+/// Back-off before the `attempt`-th delivery (1-based): `base * 2^(attempt-1)`,
+/// capped at `cap`.
+fn backoff(cfg: &RetryConfig, attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(20);
+    cfg.base.saturating_mul(1u32 << shift).min(cfg.cap)
+}
+
+/// `$dlq/...` is Relay's dead-letter namespace; such messages are never
+/// themselves dead-lettered (no infinite recursion).
+fn is_dlq_topic(topic: &str) -> bool {
+    topic.starts_with("$dlq/")
+}
 
 pub(crate) fn to_core_qos(q: WireQoS) -> QoS {
     match q {
@@ -84,15 +114,33 @@ enum Inflight {
     Qos2AwaitComp(NonZeroU16),
 }
 
+/// An in-flight message plus its redelivery bookkeeping.
+struct InflightEntry {
+    state: Inflight,
+    /// Delivery attempts made so far (initial send counts as 1).
+    attempts: u32,
+    /// Earliest instant the next redelivery is due.
+    next_due: Instant,
+}
+
+/// A message removed from an in-flight queue because delivery ultimately failed
+/// — handed to the dead-letter path.
+struct DeadMsg {
+    publish: Publish,
+    attempts: u32,
+}
+
 // ---- in-flight queue persistence (opaque blob stored by `storage`) ----
 //
-// Layout: `next_id (u16 BE)` then, per entry, a tag byte followed by its body:
+// Layout: `next_id (u16 BE)` then, per entry, `tag(u8) attempts(u32 BE)` and:
 //   1 = Qos1, 2 = Qos2AwaitRec — `pid(u16) flags(u8) topic_len(u16) topic
 //       payload_len(u32) payload` (flags bit 0 = retain)
 //   3 = Qos2AwaitComp          — `pid(u16)`
+// `next_due` is not persisted; it is recomputed from `attempts` on reload.
 
-fn encode_publish_entry(out: &mut Vec<u8>, tag: u8, p: &Publish) {
+fn encode_publish_entry(out: &mut Vec<u8>, tag: u8, attempts: u32, p: &Publish) {
     out.push(tag);
+    out.extend_from_slice(&attempts.to_be_bytes());
     let pid = p.packet_id.map(|x| x.get()).unwrap_or(0);
     out.extend_from_slice(&pid.to_be_bytes());
     out.push(if p.retain { 1 } else { 0 });
@@ -103,15 +151,18 @@ fn encode_publish_entry(out: &mut Vec<u8>, tag: u8, p: &Publish) {
     out.extend_from_slice(&p.payload);
 }
 
-/// Decode a persisted in-flight blob into `(next_id, queue)`. Returns `None` on
-/// any malformed input (the session then simply starts with an empty queue).
-fn decode_inflight(blob: &[u8]) -> Option<(u16, VecDeque<Inflight>)> {
+/// Decode a persisted in-flight blob into `(next_id, queue)`, recomputing each
+/// entry's `next_due` from its attempt count. Returns `None` on any malformed
+/// input (the session then simply starts with an empty queue).
+fn decode_inflight(blob: &[u8], now: Instant, cfg: &RetryConfig) -> Option<(u16, VecDeque<InflightEntry>)> {
     let mut c = std::io::Cursor::new(blob);
     let next_id = read_u16(&mut c)?;
     let mut queue = VecDeque::new();
     while (c.position() as usize) < blob.len() {
         let tag = read_u8(&mut c)?;
-        match tag {
+        let attempts = read_u32(&mut c)?;
+        let next_due = now + backoff(cfg, attempts.max(1));
+        let state = match tag {
             1 | 2 => {
                 let pid = NonZeroU16::new(read_u16(&mut c)?)?;
                 let retain = read_u8(&mut c)? != 0;
@@ -128,20 +179,33 @@ fn decode_inflight(blob: &[u8]) -> Option<(u16, VecDeque<Inflight>)> {
                     retain,
                     false,
                 );
-                queue.push_back(if tag == 1 {
-                    Inflight::Qos1(p)
-                } else {
-                    Inflight::Qos2AwaitRec(p)
-                });
+                if tag == 1 { Inflight::Qos1(p) } else { Inflight::Qos2AwaitRec(p) }
             }
-            3 => {
-                let pid = NonZeroU16::new(read_u16(&mut c)?)?;
-                queue.push_back(Inflight::Qos2AwaitComp(pid));
-            }
+            3 => Inflight::Qos2AwaitComp(NonZeroU16::new(read_u16(&mut c)?)?),
             _ => return None,
-        }
+        };
+        queue.push_back(InflightEntry { state, attempts, next_due });
     }
     Some((next_id, queue))
+}
+
+/// Serialize a dead-lettered message for persistence/replay. Layout:
+/// `ts(u64) attempts(u32) reason_len(u16) reason client_len(u16) client
+/// topic_len(u16) topic qos(u8) payload`.
+fn encode_dead_letter(client_id: &str, topic: &str, reason: &str, attempts: u32, qos: u8, payload: &Bytes) -> Vec<u8> {
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let mut out = Vec::new();
+    out.extend_from_slice(&ts.to_be_bytes());
+    out.extend_from_slice(&attempts.to_be_bytes());
+    out.extend_from_slice(&(reason.len() as u16).to_be_bytes());
+    out.extend_from_slice(reason.as_bytes());
+    out.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+    out.extend_from_slice(client_id.as_bytes());
+    out.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+    out.extend_from_slice(topic.as_bytes());
+    out.push(qos);
+    out.extend_from_slice(payload);
+    out
 }
 
 fn read_u8(c: &mut std::io::Cursor<&[u8]>) -> Option<u8> {
@@ -176,7 +240,7 @@ struct Session {
     /// Next packet identifier to hand out (1..=65535, never 0).
     next_id: u16,
     /// Outbound QoS > 0 messages awaiting acknowledgement, in send order.
-    inflight: VecDeque<Inflight>,
+    inflight: VecDeque<InflightEntry>,
     /// Inbound QoS 2 packet ids received and awaiting PUBREL (dedup).
     incoming_qos2: HashSet<u16>,
     /// Session-expiry interval from the latest CONNECT (seconds; 0 = discard on
@@ -212,11 +276,12 @@ impl Session {
         let mut out = Vec::new();
         out.extend_from_slice(&self.next_id.to_be_bytes());
         for entry in &self.inflight {
-            match entry {
-                Inflight::Qos1(p) => encode_publish_entry(&mut out, 1, p),
-                Inflight::Qos2AwaitRec(p) => encode_publish_entry(&mut out, 2, p),
+            match &entry.state {
+                Inflight::Qos1(p) => encode_publish_entry(&mut out, 1, entry.attempts, p),
+                Inflight::Qos2AwaitRec(p) => encode_publish_entry(&mut out, 2, entry.attempts, p),
                 Inflight::Qos2AwaitComp(pid) => {
                     out.push(3);
+                    out.extend_from_slice(&entry.attempts.to_be_bytes());
                     out.extend_from_slice(&pid.get().to_be_bytes());
                 }
             }
@@ -240,55 +305,61 @@ impl Session {
     }
 
     /// Deliver a message to this session at the given (already effective) QoS.
-    /// QoS 0 is dropped while offline; QoS 1/2 are recorded as in-flight and
-    /// transmitted when online (or held for retransmit on reconnect).
-    fn deliver(&mut self, topic: &str, payload: &Bytes, qos: QoS, retain: bool) {
+    /// QoS 0 is dropped while offline; QoS 1/2 are recorded as in-flight (with
+    /// the first retry due after one back-off) and transmitted when online.
+    fn deliver(&mut self, topic: &str, payload: &Bytes, qos: QoS, retain: bool, now: Instant, cfg: &RetryConfig) {
         match qos {
             QoS::AtMostOnce => {
                 let p = make_publish(topic, payload, WireQoS::AtMostOnce, None, retain, false);
                 self.send(Packet::Publish(Box::new(p)));
             }
-            QoS::AtLeastOnce => {
+            QoS::AtLeastOnce | QoS::ExactlyOnce => {
                 let pid = self.allocate_id();
-                let p = make_publish(topic, payload, WireQoS::AtLeastOnce, Some(pid), retain, false);
-                self.inflight.push_back(Inflight::Qos1(p.clone()));
-                self.send(Packet::Publish(Box::new(p)));
-            }
-            QoS::ExactlyOnce => {
-                let pid = self.allocate_id();
-                let p = make_publish(topic, payload, WireQoS::ExactlyOnce, Some(pid), retain, false);
-                self.inflight.push_back(Inflight::Qos2AwaitRec(p.clone()));
+                let wire = if qos == QoS::AtLeastOnce { WireQoS::AtLeastOnce } else { WireQoS::ExactlyOnce };
+                let p = make_publish(topic, payload, wire, Some(pid), retain, false);
+                let state = if qos == QoS::AtLeastOnce {
+                    Inflight::Qos1(p.clone())
+                } else {
+                    Inflight::Qos2AwaitRec(p.clone())
+                };
+                self.inflight.push_back(InflightEntry { state, attempts: 1, next_due: now + backoff(cfg, 1) });
                 self.send(Packet::Publish(Box::new(p)));
             }
         }
     }
 
-    /// Resend every in-flight message after a reconnect, marked as duplicates.
-    fn retransmit(&self) {
-        for entry in &self.inflight {
-            match entry {
+    /// Resend every in-flight message after a reconnect (marked as duplicates)
+    /// and re-arm each entry's retry clock so the timer takes over.
+    fn retransmit(&mut self, now: Instant, cfg: &RetryConfig) {
+        for entry in self.inflight.iter_mut() {
+            entry.next_due = now + backoff(cfg, entry.attempts.max(1));
+            let pkt = match &entry.state {
                 Inflight::Qos1(p) | Inflight::Qos2AwaitRec(p) => {
                     let mut p = p.clone();
                     p.dup = true;
-                    self.send(Packet::Publish(Box::new(p)));
+                    Packet::Publish(Box::new(p))
                 }
-                Inflight::Qos2AwaitComp(pid) => self.send(pubrel(*pid)),
+                Inflight::Qos2AwaitComp(pid) => pubrel(*pid),
+            };
+            if let Some(tx) = &self.tx {
+                let _ = tx.send(pkt);
             }
         }
     }
 
     fn on_puback(&mut self, pid: u16) {
-        self.inflight.retain(|e| !matches!(e, Inflight::Qos1(p) if p.packet_id.map(|x| x.get()) == Some(pid)));
+        self.inflight
+            .retain(|e| !matches!(&e.state, Inflight::Qos1(p) if p.packet_id.map(|x| x.get()) == Some(pid)));
     }
 
     /// PUBREC for one of our QoS 2 PUBLISHes: move it to "awaiting PUBCOMP" and
     /// send the PUBREL.
     fn on_pubrec(&mut self, pid: u16) {
         for entry in self.inflight.iter_mut() {
-            if let Inflight::Qos2AwaitRec(p) = entry {
+            if let Inflight::Qos2AwaitRec(p) = &entry.state {
                 if p.packet_id.map(|x| x.get()) == Some(pid) {
                     let nz = p.packet_id.expect("qos2 publish has a packet id");
-                    *entry = Inflight::Qos2AwaitComp(nz);
+                    entry.state = Inflight::Qos2AwaitComp(nz);
                     self.send(pubrel(nz));
                     return;
                 }
@@ -302,7 +373,73 @@ impl Session {
 
     fn on_pubcomp(&mut self, pid: u16) {
         self.inflight
-            .retain(|e| !matches!(e, Inflight::Qos2AwaitComp(x) if x.get() == pid));
+            .retain(|e| !matches!(&e.state, Inflight::Qos2AwaitComp(x) if x.get() == pid));
+    }
+
+    /// Drive redelivery for this (online) session: resend due, unacknowledged
+    /// messages as duplicates with back-off, and remove those that have run out
+    /// of attempts (returned for dead-lettering). A QoS 2 message past PUBREC was
+    /// already delivered, so it is never dead-lettered — its PUBREL is just
+    /// nudged again. Returns the dead messages and whether the queue changed.
+    fn tick_retries(&mut self, now: Instant, cfg: &RetryConfig) -> (Vec<DeadMsg>, bool) {
+        let mut dead = Vec::new();
+        let mut to_send: Vec<Packet> = Vec::new();
+        let mut changed = false;
+        let mut i = 0;
+        while i < self.inflight.len() {
+            if now < self.inflight[i].next_due {
+                i += 1;
+                continue;
+            }
+            let attempts = self.inflight[i].attempts;
+            let dead_now = match &self.inflight[i].state {
+                Inflight::Qos1(p) | Inflight::Qos2AwaitRec(p) => {
+                    attempts >= cfg.max_attempts && !is_dlq_topic(&p.topic)
+                }
+                Inflight::Qos2AwaitComp(_) => false,
+            };
+            if dead_now {
+                if let Some(entry) = self.inflight.remove(i) {
+                    if let Inflight::Qos1(p) | Inflight::Qos2AwaitRec(p) = entry.state {
+                        dead.push(DeadMsg { publish: p, attempts });
+                    }
+                }
+                changed = true;
+                // do not advance `i`: the next entry shifted into this slot
+                continue;
+            }
+            let pkt = match &self.inflight[i].state {
+                Inflight::Qos1(p) | Inflight::Qos2AwaitRec(p) => {
+                    let mut p = p.clone();
+                    p.dup = true;
+                    Packet::Publish(Box::new(p))
+                }
+                Inflight::Qos2AwaitComp(pid) => pubrel(*pid),
+            };
+            self.inflight[i].attempts = attempts + 1;
+            self.inflight[i].next_due = now + backoff(cfg, attempts + 1);
+            to_send.push(pkt);
+            changed = true;
+            i += 1;
+        }
+        for pkt in to_send {
+            self.send(pkt);
+        }
+        (dead, changed)
+    }
+
+    /// Remove every undelivered QoS 1/2 message (those still awaiting the first
+    /// confirmation) for dead-lettering when the session is torn down on expiry.
+    fn drain_undelivered(&mut self) -> Vec<DeadMsg> {
+        let mut dead = Vec::new();
+        self.inflight.retain(|e| match &e.state {
+            Inflight::Qos1(p) | Inflight::Qos2AwaitRec(p) if !is_dlq_topic(&p.topic) => {
+                dead.push(DeadMsg { publish: p.clone(), attempts: e.attempts });
+                false
+            }
+            _ => true,
+        });
+        dead
     }
 }
 
@@ -335,13 +472,15 @@ struct Inner {
     retained: Mutex<RetainedStore>,
     sessions: Mutex<SessionTable>,
     storage: Option<Storage>,
+    retry: RetryConfig,
 }
 
 impl Hub {
     /// Build the broker state. With a [`Storage`], retained messages are loaded
     /// from disk at startup and persisted on change; without one, Relay is fully
-    /// in-memory.
-    pub fn new(storage: Option<Storage>) -> Self {
+    /// in-memory. `retry` governs redelivery back-off and dead-lettering.
+    pub fn new(storage: Option<Storage>, retry: RetryConfig) -> Self {
+        let now = Instant::now();
         let mut retained = RetainedStore::new();
         let mut router = Router::new();
         let mut table = SessionTable::default();
@@ -385,7 +524,7 @@ impl Hub {
                         // its in-flight queue + packet-id counter if any.
                         let mut session = Session::new(ps.client_id.clone(), None, ps.expiry_secs, 0);
                         if let Some((next_id, queue)) =
-                            inflight.get(&ps.client_id).and_then(|b| decode_inflight(b))
+                            inflight.get(&ps.client_id).and_then(|b| decode_inflight(b, now, &retry))
                         {
                             session.next_id = next_id;
                             session.inflight = queue;
@@ -409,6 +548,7 @@ impl Hub {
                 retained: Mutex::new(retained),
                 sessions: Mutex::new(table),
                 storage,
+                retry,
             }),
         };
 
@@ -418,6 +558,21 @@ impl Hub {
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(expiry as u64)).await;
                 hub.purge_if_idle(id, 0);
+            });
+        }
+
+        // Redelivery timer: periodically resend due, unacknowledged messages
+        // (with back-off) and dead-letter those that run out of attempts.
+        {
+            let hub = hub.clone();
+            let period = retry.base.max(Duration::from_millis(100));
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(period);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    hub.run_retries();
+                }
             });
         }
 
@@ -456,7 +611,7 @@ impl Hub {
             session.tx = Some(tx);
             session.expiry_secs = expiry_secs;
             session.generation = generation;
-            session.retransmit();
+            session.retransmit(Instant::now(), &self.inner.retry);
             self.persist_meta(client_id, expiry_secs);
             return Connected { id, generation, rx, session_present: true };
         }
@@ -559,16 +714,87 @@ impl Hub {
     }
 
     /// Purge a session that is still offline and at the expected generation.
+    /// Any messages it never managed to deliver are dead-lettered first.
     fn purge_if_idle(&self, id: ClientId, generation: u64) {
-        let mut table = self.inner.sessions.lock().unwrap();
-        let drop_it = matches!(
-            table.by_id.get(&id),
-            Some(s) if s.generation == generation && s.tx.is_none()
-        );
-        if drop_it {
+        let dead: Vec<(String, DeadMsg)> = {
+            let mut table = self.inner.sessions.lock().unwrap();
+            let drop_it = matches!(
+                table.by_id.get(&id),
+                Some(s) if s.generation == generation && s.tx.is_none()
+            );
+            if !drop_it {
+                return;
+            }
             debug!(client = id.0, "session expired, purging");
+            let dead = table
+                .by_id
+                .get_mut(&id)
+                .map(|s| {
+                    let cid = s.client_id.clone();
+                    s.drain_undelivered().into_iter().map(move |d| (cid.clone(), d)).collect()
+                })
+                .unwrap_or_else(Vec::new);
             self.discard(&mut table, id);
+            dead
+        };
+        for (client_id, msg) in dead {
+            self.dead_letter(&client_id, &msg, "session_expired");
         }
+    }
+
+    /// Drive the redelivery timer over every online session: resend due
+    /// unacknowledged messages with back-off, dead-letter those out of attempts,
+    /// and persist the queues that changed (durable sessions only).
+    fn run_retries(&self) {
+        let now = Instant::now();
+        let mut dead: Vec<(String, DeadMsg)> = Vec::new();
+        let mut to_persist: Vec<(String, Vec<u8>)> = Vec::new();
+        {
+            let mut table = self.inner.sessions.lock().unwrap();
+            for session in table.by_id.values_mut() {
+                if session.tx.is_none() {
+                    continue; // offline: wait for reconnect, don't retry
+                }
+                let (dead_msgs, changed) = session.tick_retries(now, &self.inner.retry);
+                for d in dead_msgs {
+                    dead.push((session.client_id.clone(), d));
+                }
+                if changed {
+                    to_persist.extend(self.snapshot_inflight(session));
+                }
+            }
+        }
+        for (client_id, blob) in to_persist {
+            self.write_inflight(&client_id, &blob);
+        }
+        for (client_id, msg) in dead {
+            self.dead_letter(&client_id, &msg, "max_delivery_attempts_exceeded");
+        }
+    }
+
+    /// Dead-letter a message that could not be delivered: persist it (for later
+    /// replay) and republish it on `$dlq/{client_id}/{original_topic}` so an
+    /// operator subscribed to `$dlq/#` sees it in real time. Never recurses on a
+    /// message already in the `$dlq/` namespace.
+    fn dead_letter(&self, client_id: &str, msg: &DeadMsg, reason: &str) {
+        let original_topic = msg.publish.topic.as_ref();
+        if is_dlq_topic(original_topic) {
+            return;
+        }
+        let qos = to_core_qos(msg.publish.qos);
+        warn!(%client_id, topic = original_topic, attempts = msg.attempts, reason, "dead-lettering message");
+
+        if let Some(storage) = &self.inner.storage {
+            let blob = encode_dead_letter(client_id, original_topic, reason, msg.attempts, qos as u8, &msg.publish.payload);
+            if let Err(e) = storage.append_dead_letter(&blob) {
+                warn!(%client_id, error = %e, "failed to persist dead-lettered message");
+            }
+        }
+
+        let dlq_topic = format!("$dlq/{client_id}/{original_topic}");
+        // Republish at the original QoS so the dead-letter consumer gets the same
+        // delivery guarantee. Detailed metadata lives in the persisted record.
+        self.publish(&dlq_topic, &msg.publish.payload, qos, false);
     }
 
     /// Remove a session entirely: table entries, subscriptions, and disk record.
@@ -642,11 +868,12 @@ impl Hub {
             let mut table = self.inner.sessions.lock().unwrap();
             match table.by_id.get_mut(&id) {
                 Some(session) => {
+                    let now = Instant::now();
                     let mut any_qos_gt0 = false;
                     for msg in retained {
                         let effective = msg.qos.min(granted);
                         any_qos_gt0 |= effective != QoS::AtMostOnce;
-                        session.deliver(&msg.topic, &msg.payload, effective, true);
+                        session.deliver(&msg.topic, &msg.payload, effective, true, now, &self.inner.retry);
                     }
                     if any_qos_gt0 {
                         self.snapshot_inflight(session)
@@ -690,11 +917,12 @@ impl Hub {
         let mut to_persist: Vec<(String, Vec<u8>)> = Vec::new();
         let mut delivered = 0;
         {
+            let now = Instant::now();
             let mut table = self.inner.sessions.lock().unwrap();
             for (id, granted) in targets {
                 if let Some(session) = table.by_id.get_mut(&id) {
                     let effective = msg_qos.min(granted);
-                    session.deliver(topic, payload, effective, false);
+                    session.deliver(topic, payload, effective, false, now, &self.inner.retry);
                     delivered += 1;
                     // Only QoS > 0 changes the in-flight queue.
                     if effective != QoS::AtMostOnce {
@@ -771,6 +999,6 @@ impl Hub {
 
 impl Default for Hub {
     fn default() -> Self {
-        Self::new(None)
+        Self::new(None, RetryConfig::default())
     }
 }

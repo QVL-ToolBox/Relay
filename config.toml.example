@@ -7,8 +7,17 @@ tcp_addr = "0.0.0.0:1883"
 # WebSocket listener for browser / mobile clients (MQTT-over-WebSocket).
 ws_addr = "0.0.0.0:8083"
 
-# On-disk store directory. When set, retained messages survive restarts
-# (an embedded `redb` file is created inside). Leave unset for in-memory only.
+# On-disk store directory. When set, retained messages, durable sessions and
+# their in-flight queues survive restarts (an embedded `redb` file is created
+# inside). Leave unset for in-memory only.
 # Use a TOML literal string (single quotes) for Windows paths.
 # data_dir = 'C:\relay-data'
 # data_dir = "/var/lib/relay"
+
+# Redelivery / dead-letter policy for unacknowledged QoS 1/2 messages.
+# Total delivery attempts before a message is dead-lettered (1 = no retry).
+max_delivery_attempts = 5
+# Base back-off between attempts, in seconds (doubles each attempt, capped below).
+retry_base_secs = 5
+# Upper bound on the redelivery back-off, in seconds.
+retry_max_secs = 60

@@ -66,7 +66,7 @@ with `RELAY_CONFIG`.
 - [x] On-disk persistence — **retained messages** survive restart (`redb` embedded store, opt-in via `data_dir`, verified end-to-end)
 - [x] On-disk persistence — **durable sessions**: a `clean_start=false` client's identity + subscriptions survive a restart (`session_present` after reload, verified end-to-end)
 - [x] On-disk persistence — **in-flight QoS 1/2 queues**: unacknowledged outbound messages (including those queued while a durable client is offline) survive a restart and are retransmitted on reconnect (verified end-to-end)
-- [ ] Dead-letter queue + retry with backoff
+- [x] **Dead-letter queue + retry with back-off** — unacknowledged QoS 1/2 messages are redelivered with exponential back-off; after `max_delivery_attempts` (or when a durable session expires undelivered) they are republished on `$dlq/{client}/{topic}` and persisted for replay (verified end-to-end)
 - [ ] Replay / event-sourcing from an offset
 - [ ] HTTP admin API + monitoring dashboard
 - [ ] TLS
@@ -81,3 +81,4 @@ with `RELAY_CONFIG`.
 | Last known value | Retained messages |
 | Dead service detection | Will message (LWT) |
 | Message TTL | Message Expiry Interval |
+| Undeliverable messages | Dead-letter queue (`$dlq/#`) + retry with back-off *(Relay extension)* |
