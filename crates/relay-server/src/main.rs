@@ -1,18 +1,14 @@
 //! Relay daemon entry point.
 //!
-//! V1 wiring status:
-//! - [x] config load (TOML)
-//! - [x] TCP + WebSocket listeners accepting connections
-//! - [ ] MQTT 5.0 packet codec (CONNECT/PUBLISH/SUBSCRIBE/…)  — next step
-//! - [ ] broker routing via `relay-core` (subscriptions, retained, shared subs)
-//! - [ ] QoS 1/2 acknowledgement flows
-//!
-//! For now the listeners accept sockets and log them, so the daemon runs and the
-//! plumbing is in place; the codec + broker loop plug into `handle_connection`.
+//! Binds two listeners and runs the same MQTT broker loop over both:
+//! - **tcp://** — raw MQTT for backends and native clients;
+//! - **ws://**  — MQTT-over-WebSocket for browsers and mobile (HTTP upgrade,
+//!   `mqtt` subprotocol), bridged to bytes by [`ws::WsByteStream`].
 
 mod config;
 mod connection;
 mod hub;
+mod ws;
 
 use config::Config;
 use hub::Hub;
@@ -37,10 +33,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tcp = TcpListener::bind(config.tcp_addr).await?;
     info!("relay listening on tcp://{}", config.tcp_addr);
 
-    // The WebSocket listener will upgrade HTTP -> WS and run MQTT-over-WebSocket.
-    // For V1 scaffolding it binds and accepts; the upgrade is wired with the codec.
-    let ws = TcpListener::bind(config.ws_addr).await?;
-    info!("relay listening on ws://{} (WebSocket upgrade TODO)", config.ws_addr);
+    // The WebSocket listener upgrades HTTP -> WS (mqtt subprotocol) and runs the
+    // same MQTT broker loop over the WebSocket byte stream.
+    let ws_listener = TcpListener::bind(config.ws_addr).await?;
+    info!("relay listening on ws://{}", config.ws_addr);
 
     let hub = Hub::new();
 
@@ -55,11 +51,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(e) => warn!(error = %e, "TCP accept failed"),
                 }
             }
-            res = ws.accept() => {
+            res = ws_listener.accept() => {
                 match res {
-                    // WebSocket upgrade + MQTT-over-WS is the next transport to wire.
-                    Ok((_socket, peer)) => {
-                        warn!(%peer, "WebSocket transport not implemented yet (upgrade TODO)");
+                    Ok((socket, peer)) => {
+                        info!(%peer, "accepted WebSocket connection");
+                        let hub = hub.clone();
+                        tokio::spawn(async move {
+                            match tokio_tungstenite::accept_hdr_async(socket, ws::upgrade_callback).await {
+                                Ok(stream) => {
+                                    let io = ws::WsByteStream::new(stream);
+                                    connection::handle(io, format!("ws://{peer}"), hub).await;
+                                }
+                                Err(e) => warn!(%peer, error = %e, "WebSocket handshake failed"),
+                            }
+                        });
                     }
                     Err(e) => warn!(error = %e, "WS accept failed"),
                 }

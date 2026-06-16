@@ -53,9 +53,9 @@ with `RELAY_CONFIG`.
 - [x] **QoS 1** (at-least-once) — PUBACK to publisher + QoS-1 delivery with per-connection packet ids, granted via SUBACK (verified end-to-end)
 - [x] **Retained messages** — last value per topic, replayed to late subscribers (retain flag set), cleared by an empty payload (verified end-to-end)
 - [x] **Will (LWT)** — published on abnormal disconnect, discarded on a clean DISCONNECT (verified end-to-end)
+- [x] **WebSocket transport** — MQTT-over-WS (HTTP upgrade, `mqtt` subprotocol) for browser/mobile, same broker loop as TCP (verified end-to-end)
 - [ ] QoS 2 acknowledgement flow (PUBREC / PUBREL / PUBCOMP)
 - [ ] Sessions (clean start / session expiry)
-- [ ] WebSocket transport (browser/mobile)
 
 > **Codec note:** we use `rmqtt-codec` (from the rmqtt broker project: tokio-util 0.7 / bytes 1.x).
 > `mqttbytes` 0.6 was rejected — its v5 CONNACK encoding omits the mandatory property-length byte;

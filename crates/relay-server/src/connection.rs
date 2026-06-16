@@ -27,7 +27,7 @@ use rmqtt_codec::v5::{
     Codec, ConnectAck, ConnectAckReason, DisconnectReasonCode, Packet, PublishAck,
     PublishAckReason, PublishProperties, QoS as WireQoS, SubscribeAck, SubscribeAckReason,
 };
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::Framed;
 use tracing::{debug, info, warn};
 
@@ -114,10 +114,19 @@ fn build_publish(delivery: Delivery, qos_state: &mut OutboundQos) -> Packet {
     }))
 }
 
-/// Drive a single TCP client connection until it disconnects or errors.
-pub async fn handle(socket: TcpStream, peer: String, hub: Hub) {
+/// Drive a single client connection until it disconnects or errors.
+///
+/// Transport-agnostic: `io` is any byte stream — a raw [`TcpStream`] or the
+/// WebSocket byte adapter ([`crate::ws::WsByteStream`]) — so the exact same MQTT
+/// loop serves both the TCP and the WebSocket listener.
+///
+/// [`TcpStream`]: tokio::net::TcpStream
+pub async fn handle<S>(io: S, peer: String, hub: Hub)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let (id, mut rx) = hub.register();
-    let (mut sink, mut stream) = Framed::new(socket, Codec::new(MAX_INBOUND_SIZE, 0)).split();
+    let (mut sink, mut stream) = Framed::new(io, Codec::new(MAX_INBOUND_SIZE, 0)).split();
     let mut connected = false;
     let mut qos_state = OutboundQos::new();
     // The client's Will, published if the connection ends *without* a clean

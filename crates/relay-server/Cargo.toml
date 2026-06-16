@@ -22,3 +22,9 @@ bytes.workspace = true
 rmqtt-codec.workspace = true    # MQTT v5 codec (tokio-util 0.7 / bytes 1.x) from the rmqtt broker
 tokio-util.workspace = true     # Framed (codec <-> stream/sink)
 futures.workspace = true        # StreamExt / SinkExt over Framed
+tokio-tungstenite.workspace = true  # MQTT-over-WebSocket (HTTP -> WS upgrade)
+
+[dev-dependencies]
+# WebSocket *client* for the e2e test (adds the `connect` feature; only pulled
+# in for tests, the daemon itself stays handshake-only).
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake", "connect"] }
