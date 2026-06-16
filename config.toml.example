@@ -27,3 +27,10 @@ retry_max_secs = 60
 # publishing to `$replay/{from_offset}/{topic_filter}`. This caps the log size;
 # the oldest events are pruned beyond it. Set to 0 to disable the log (no replay).
 event_log_max = 100000
+
+# Secure MQTT (mqtts). TLS is enabled only when tls_cert AND tls_key are set;
+# tls_addr defaults to 0.0.0.0:8883 (the IANA mqtts port) if omitted. Point them
+# at a PEM certificate chain and PEM private key.
+# tls_addr = "0.0.0.0:8883"
+# tls_cert = '/etc/relay/cert.pem'
+# tls_key  = '/etc/relay/key.pem'

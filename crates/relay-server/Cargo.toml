@@ -24,8 +24,14 @@ tokio-util.workspace = true     # Framed (codec <-> stream/sink)
 futures.workspace = true        # StreamExt / SinkExt over Framed
 tokio-tungstenite.workspace = true  # MQTT-over-WebSocket (HTTP -> WS upgrade)
 redb.workspace = true               # on-disk store for retained messages (V2)
+rustls.workspace = true             # TLS (mqtts)
+tokio-rustls.workspace = true       # rustls <-> tokio streams
+rustls-pemfile.workspace = true     # load PEM cert/key files
 
 [dev-dependencies]
 # WebSocket *client* for the e2e test (adds the `connect` feature; only pulled
 # in for tests, the daemon itself stays handshake-only).
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake", "connect"] }
+# TLS *client* + self-signed cert generation for the mqtts e2e test.
+tokio-rustls.workspace = true
+rcgen.workspace = true

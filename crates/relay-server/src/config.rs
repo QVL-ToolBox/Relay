@@ -28,6 +28,13 @@ pub struct Config {
     /// pruned beyond this). `0` disables the event log (no replay). Requires
     /// `data_dir`.
     pub event_log_max: u64,
+    /// Secure MQTT (mqtts) listener address. TLS is enabled only when this and
+    /// both `tls_cert` and `tls_key` are set.
+    pub tls_addr: Option<SocketAddr>,
+    /// PEM certificate chain for the mqtts listener.
+    pub tls_cert: Option<PathBuf>,
+    /// PEM private key for the mqtts listener.
+    pub tls_key: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -41,6 +48,9 @@ impl Default for Config {
             retry_base_secs: 5,
             retry_max_secs: 60,
             event_log_max: 100_000,
+            tls_addr: None,
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }

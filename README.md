@@ -68,8 +68,8 @@ with `RELAY_CONFIG`.
 - [x] On-disk persistence — **in-flight QoS 1/2 queues**: unacknowledged outbound messages (including those queued while a durable client is offline) survive a restart and are retransmitted on reconnect (verified end-to-end)
 - [x] **Dead-letter queue + retry with back-off** — unacknowledged QoS 1/2 messages are redelivered with exponential back-off; after `max_delivery_attempts` (or when a durable session expires undelivered) they are republished on `$dlq/{client}/{topic}` and persisted for replay (verified end-to-end)
 - [x] **Replay / event-sourcing from an offset** — every published message is journalled with a global offset (bounded log); a client replays from an offset by publishing `$replay/{from}/{filter}`, receiving the matching events tagged with their offset (verified end-to-end)
+- [x] **TLS (mqtts)** — optional secure listener (rustls/`ring`), enabled by pointing `tls_cert` + `tls_key` at PEM files; same broker loop over the TLS stream (verified end-to-end against a self-signed cert)
 - [ ] HTTP admin API + monitoring dashboard
-- [ ] TLS
 
 ## Feature mapping (what MQTT 5 gives us out of the box)
 
