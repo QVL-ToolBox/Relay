@@ -6,6 +6,7 @@
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rmqtt_codec::types::Publish;
 use rmqtt_codec::v5::{
     Codec, Connect, Packet, PublishAck, PublishAckReason, PublishProperties, QoS, Subscribe,
@@ -22,6 +23,14 @@ const TOPIC: &str = "orders/+/created";
 const PUB_TOPIC: &str = "orders/42/created";
 const TCP_PORT: u16 = 21897;
 const WS_PORT: u16 = 28097;
+const SECRET: &str = "e2e-inflight-persist-secret";
+const EXP: i64 = 4_102_444_800;
+
+fn jwt(sub: &str, roles: &[&str]) -> String {
+    let claims = serde_json::json!({ "sub": sub, "roles": roles, "exp": EXP });
+    encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(SECRET.as_bytes()))
+        .expect("encode jwt")
+}
 
 struct ChildGuard(Child);
 impl Drop for ChildGuard {
@@ -33,7 +42,7 @@ impl Drop for ChildGuard {
 
 type Client = Framed<TcpStream, Codec>;
 
-fn connect_packet(client_id: &str, clean_start: bool, expiry: u32) -> Connect {
+fn connect_packet(client_id: &str, clean_start: bool, expiry: u32, token: &str) -> Connect {
     Connect {
         clean_start,
         keep_alive: 0,
@@ -49,7 +58,7 @@ fn connect_packet(client_id: &str, clean_start: bool, expiry: u32) -> Connect {
         last_will: None,
         client_id: client_id.into(),
         username: None,
-        password: None,
+        password: Some(Bytes::from(token.to_string())),
         cert: None,
     }
 }
@@ -77,7 +86,7 @@ async fn connect(addr: &str, client_id: &str, clean_start: bool, expiry: u32) ->
     };
     let mut framed = Framed::new(stream, Codec::new(256 * 1024, 0));
     framed
-        .send(Packet::from(connect_packet(client_id, clean_start, expiry)))
+        .send(Packet::from(connect_packet(client_id, clean_start, expiry, &jwt(client_id, &["*"]))))
         .await
         .expect("send CONNECT");
     match next_packet(&mut framed).await {
@@ -132,7 +141,15 @@ async fn queued_qos1_message_survives_a_restart() {
     std::fs::write(
         &cfg_path,
         format!(
-            "tcp_addr = \"127.0.0.1:{TCP_PORT}\"\nws_addr = \"127.0.0.1:{WS_PORT}\"\ndata_dir = '{}'\n",
+            "tcp_addr = \"127.0.0.1:{TCP_PORT}\"\nws_addr = \"127.0.0.1:{WS_PORT}\"\ndata_dir = '{}'\n\
+             \n\
+             [auth]\n\
+             jwt_secret = \"{SECRET}\"\n\
+             \n\
+             [[auth.acl]]\n\
+             role = \"*\"\n\
+             publish = [\"#\"]\n\
+             subscribe = [\"#\"]\n",
             data_dir.display()
         ),
     )

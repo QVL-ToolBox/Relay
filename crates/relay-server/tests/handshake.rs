@@ -2,13 +2,24 @@
 //! using the same MQTT v5 codec, send a genuine CONNECT, and assert the broker
 //! replies with a successful CONNACK.
 
+use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rmqtt_codec::v5::{Codec, Connect, ConnectAckReason, Packet};
 use std::process::{Child, Command};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout, Instant};
 use tokio_util::codec::Framed;
+
+const SECRET: &str = "e2e-handshake-secret";
+const EXP: i64 = 4_102_444_800;
+
+fn jwt(sub: &str, roles: &[&str]) -> String {
+    let claims = serde_json::json!({ "sub": sub, "roles": roles, "exp": EXP });
+    encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(SECRET.as_bytes()))
+        .expect("encode jwt")
+}
 
 /// Kills the spawned broker when the test ends (even on panic).
 struct ChildGuard(Child);
@@ -35,7 +46,7 @@ fn test_connect() -> Connect {
         last_will: None,
         client_id: "relay-test-client".into(),
         username: None,
-        password: None,
+        password: Some(Bytes::from(jwt("relay-test-client", &["*"]))),
         cert: None,
     }
 }
@@ -47,7 +58,17 @@ async fn connect_gets_connack() {
     let cfg = std::env::temp_dir().join("relay-handshake-test.toml");
     std::fs::write(
         &cfg,
-        format!("tcp_addr = \"127.0.0.1:{tcp_port}\"\nws_addr = \"127.0.0.1:28083\"\n"),
+        format!(
+            "tcp_addr = \"127.0.0.1:{tcp_port}\"\nws_addr = \"127.0.0.1:28083\"\n\
+             \n\
+             [auth]\n\
+             jwt_secret = \"{SECRET}\"\n\
+             \n\
+             [[auth.acl]]\n\
+             role = \"*\"\n\
+             publish = [\"#\"]\n\
+             subscribe = [\"#\"]\n"
+        ),
     )
     .expect("write test config");
 

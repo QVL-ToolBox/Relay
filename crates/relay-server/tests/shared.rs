@@ -5,6 +5,7 @@
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rmqtt_codec::types::Publish;
 use rmqtt_codec::v5::{
     Codec, Connect, Packet, PublishProperties, QoS, Subscribe, SubscriptionOptions,
@@ -17,6 +18,14 @@ use tokio_util::codec::Framed;
 
 const SHARED_FILTER: &str = "$share/workers/jobs";
 const TOPIC: &str = "jobs";
+const SECRET: &str = "e2e-shared-secret";
+const EXP: i64 = 4_102_444_800;
+
+fn jwt(sub: &str, roles: &[&str]) -> String {
+    let claims = serde_json::json!({ "sub": sub, "roles": roles, "exp": EXP });
+    encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(SECRET.as_bytes()))
+        .expect("encode jwt")
+}
 
 struct ChildGuard(Child);
 impl Drop for ChildGuard {
@@ -28,7 +37,7 @@ impl Drop for ChildGuard {
 
 type Client = Framed<TcpStream, Codec>;
 
-fn connect_packet(client_id: &str) -> Connect {
+fn connect_packet(client_id: &str, token: &str) -> Connect {
     Connect {
         clean_start: true,
         keep_alive: 0,
@@ -44,7 +53,7 @@ fn connect_packet(client_id: &str) -> Connect {
         last_will: None,
         client_id: client_id.into(),
         username: None,
-        password: None,
+        password: Some(Bytes::from(token.to_string())),
         cert: None,
     }
 }
@@ -72,7 +81,7 @@ async fn connect(addr: &str, client_id: &str) -> Client {
     };
     let mut framed = Framed::new(stream, Codec::new(256 * 1024, 0));
     framed
-        .send(Packet::from(connect_packet(client_id)))
+        .send(Packet::from(connect_packet(client_id, &jwt(client_id, &["*"]))))
         .await
         .expect("send CONNECT");
     match next_packet(&mut framed).await {
@@ -124,7 +133,17 @@ async fn shared_subscription_distributes_one_message_per_worker() {
     let cfg = std::env::temp_dir().join("relay-shared-test.toml");
     std::fs::write(
         &cfg,
-        format!("tcp_addr = \"127.0.0.1:{tcp_port}\"\nws_addr = \"127.0.0.1:28085\"\n"),
+        format!(
+            "tcp_addr = \"127.0.0.1:{tcp_port}\"\nws_addr = \"127.0.0.1:28085\"\n\
+             \n\
+             [auth]\n\
+             jwt_secret = \"{SECRET}\"\n\
+             \n\
+             [[auth.acl]]\n\
+             role = \"*\"\n\
+             publish = [\"#\"]\n\
+             subscribe = [\"#\"]\n"
+        ),
     )
     .expect("write test config");
 

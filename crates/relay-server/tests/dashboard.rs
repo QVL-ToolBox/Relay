@@ -2,7 +2,9 @@
 //! reflects live broker state. With one MQTT subscriber connected, `/stats`
 //! reports it, and `/` serves the HTML page.
 
+use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rmqtt_codec::v5::{Codec, Connect, Packet, Subscribe, SubscriptionOptions};
 use std::time::Duration;
 use std::process::{Child, Command};
@@ -14,6 +16,14 @@ use tokio_util::codec::Framed;
 const TCP_PORT: u16 = 21903;
 const WS_PORT: u16 = 28103;
 const HTTP_PORT: u16 = 21904;
+const SECRET: &str = "e2e-dashboard-secret";
+const EXP: i64 = 4_102_444_800;
+
+fn jwt(sub: &str, roles: &[&str]) -> String {
+    let claims = serde_json::json!({ "sub": sub, "roles": roles, "exp": EXP });
+    encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(SECRET.as_bytes()))
+        .expect("encode jwt")
+}
 
 struct ChildGuard(Child);
 impl Drop for ChildGuard {
@@ -25,7 +35,7 @@ impl Drop for ChildGuard {
 
 type Client = Framed<TcpStream, Codec>;
 
-fn connect_packet(client_id: &str) -> Connect {
+fn connect_packet(client_id: &str, password: &str) -> Connect {
     Connect {
         clean_start: true,
         keep_alive: 0,
@@ -41,12 +51,12 @@ fn connect_packet(client_id: &str) -> Connect {
         last_will: None,
         client_id: client_id.into(),
         username: None,
-        password: None,
+        password: Some(Bytes::from(password.to_string())),
         cert: None,
     }
 }
 
-async fn connect(addr: &str, client_id: &str) -> Client {
+async fn connect(addr: &str, client_id: &str, password: &str) -> Client {
     let deadline = Instant::now() + Duration::from_secs(5);
     let stream = loop {
         match TcpStream::connect(addr).await {
@@ -57,7 +67,7 @@ async fn connect(addr: &str, client_id: &str) -> Client {
     };
     let mut framed = Framed::new(stream, Codec::new(256 * 1024, 0));
     framed
-        .send(Packet::from(connect_packet(client_id)))
+        .send(Packet::from(connect_packet(client_id, password)))
         .await
         .expect("send CONNECT");
     match timeout(Duration::from_secs(5), framed.next()).await {
@@ -95,7 +105,15 @@ async fn dashboard_reports_live_state() {
         &cfg,
         format!(
             "tcp_addr = \"127.0.0.1:{TCP_PORT}\"\nws_addr = \"127.0.0.1:{WS_PORT}\"\n\
-             http_addr = \"127.0.0.1:{HTTP_PORT}\"\ndata_dir = '{}'\n",
+             http_addr = \"127.0.0.1:{HTTP_PORT}\"\ndata_dir = '{}'\n\
+             \n\
+             [auth]\n\
+             jwt_secret = \"{SECRET}\"\n\
+             \n\
+             [[auth.acl]]\n\
+             role = \"*\"\n\
+             publish = [\"sensors/#\"]\n\
+             subscribe = [\"sensors/#\"]\n",
             data_dir.display()
         ),
     )
@@ -112,7 +130,8 @@ async fn dashboard_reports_live_state() {
     let http_addr = format!("127.0.0.1:{HTTP_PORT}");
 
     // One subscriber online with one subscription.
-    let mut sub = connect(&mqtt_addr, "watcher").await;
+    let token = jwt("watcher", &["*"]);
+    let mut sub = connect(&mqtt_addr, "watcher", &token).await;
     sub.send(Packet::Subscribe(Subscribe {
         packet_id: 1.try_into().unwrap(),
         id: None,

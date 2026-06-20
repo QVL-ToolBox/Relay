@@ -1,16 +1,3 @@
-//! Optional JWT authentication + topic ACL (authorization).
-//!
-//! Auth is **opt-in**: with no `[auth]` section in the config the broker stays
-//! open (its historical behaviour). When `[auth]` is present, every CONNECT must
-//! carry a valid JWT (sent as the MQTT *password*); the broker validates it
-//! (HS256, shared secret) and derives the client's topic permissions from the
-//! ACL rules, matched by the token's roles and templated with the token's claims
-//! (e.g. `{sub}`).
-//!
-//! The design is **generic** — it is not tied to any one project: the signing
-//! secret, the identity claim and the roles claim are all configurable, and ACL
-//! patterns may reference any string claim via `{claim}` placeholders.
-
 use std::collections::HashMap;
 
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
@@ -18,18 +5,13 @@ use relay_core::Acl;
 use serde::Deserialize;
 use serde_json::Value;
 
-/// `[auth]` configuration block. Absent ⇒ authentication disabled.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthConfig {
-    /// HS256 shared secret used to verify the JWT signature.
     pub jwt_secret: String,
-    /// Claim used as the principal identity (and as `{sub}` in ACL templates).
     #[serde(default = "default_identity_claim")]
     pub identity_claim: String,
-    /// Claim holding the principal's roles (a JSON array of strings).
     #[serde(default = "default_roles_claim")]
     pub roles_claim: String,
-    /// ACL rules. A client gets the union of every rule whose `role` matches.
     #[serde(default)]
     pub acl: Vec<AclRule>,
 }
@@ -44,9 +26,6 @@ fn default_role() -> String {
     "*".into()
 }
 
-/// One ACL rule: grants the listed publish/subscribe topic patterns to clients
-/// holding `role` (`"*"` = any authenticated client). Patterns may contain
-/// `{claim}` placeholders substituted from the token (e.g. `drive/{sub}/#`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AclRule {
     #[serde(default = "default_role")]
@@ -57,30 +36,23 @@ pub struct AclRule {
     pub subscribe: Vec<String>,
 }
 
-/// An authenticated client: its identity (for logging) and effective topic ACL.
 pub struct Principal {
     pub identity: String,
     pub acl: Acl,
 }
 
-/// Why a CONNECT was rejected (mapped to a CONNACK reason by the caller).
 #[derive(Debug)]
 pub enum AuthError {
-    /// No token, malformed token, bad signature, or expired.
     InvalidToken,
-    /// Token verified but carries no usable identity claim.
     NoIdentity,
 }
 
 impl AuthConfig {
-    /// Verify the JWT carried in the MQTT password and build the client's
-    /// principal (identity + templated ACL). The username is not required.
     pub fn authenticate(&self, password: Option<&[u8]>) -> Result<Principal, AuthError> {
         let raw = password.ok_or(AuthError::InvalidToken)?;
         let token = std::str::from_utf8(raw).map_err(|_| AuthError::InvalidToken)?;
 
         let mut validation = Validation::new(Algorithm::HS256);
-        // Identity/roles are app-defined claims; we don't constrain the audience.
         validation.validate_aud = false;
         let data = decode::<Value>(
             token,
@@ -102,7 +74,6 @@ impl AuthConfig {
             .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
             .unwrap_or_default();
 
-        // Variables available to ACL templates: every string claim, plus `{sub}`.
         let mut vars: HashMap<&str, &str> = claims
             .iter()
             .filter_map(|(k, v)| v.as_str().map(|s| (k.as_str(), s)))
@@ -130,8 +101,6 @@ impl AuthConfig {
     }
 }
 
-/// Replace every `{key}` in `pattern` with its claim value. Returns `None` if a
-/// referenced claim is missing — that pattern then grants nothing (fail closed).
 fn substitute(pattern: &str, vars: &HashMap<&str, &str>) -> Option<String> {
     let mut out = String::with_capacity(pattern.len());
     let mut rest = pattern;
@@ -168,8 +137,7 @@ mod tests {
         }
     }
 
-    // exp far in the future
-    const EXP: i64 = 4_102_444_800; // 2100-01-01
+    const EXP: i64 = 4_102_444_800;
 
     #[test]
     fn rejects_missing_or_bad_token() {

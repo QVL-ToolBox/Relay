@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rmqtt_codec::types::Publish;
 use rmqtt_codec::v5::{
     Codec, Connect, Packet, PublishProperties, QoS, Subscribe, SubscriptionOptions,
@@ -10,6 +11,15 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout, Instant};
 use tokio_util::codec::Framed;
+
+const SECRET: &str = "e2e-us04-secret";
+const EXP: i64 = 4_102_444_800;
+
+fn jwt(sub: &str, roles: &[&str]) -> String {
+    let claims = serde_json::json!({ "sub": sub, "roles": roles, "exp": EXP });
+    encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(SECRET.as_bytes()))
+        .expect("encode jwt")
+}
 
 type Client = Framed<TcpStream, Codec>;
 
@@ -51,7 +61,15 @@ impl Broker {
     fn spawn(&mut self, ws_port: u16) {
         let data_dir_literal = self.data_dir.display().to_string().replace('\\', "/");
         let cfg = format!(
-            "tcp_addr = \"127.0.0.1:{}\"\nws_addr = \"127.0.0.1:{}\"\ndata_dir = \"{}\"\nevent_log_max = 100000\n",
+            "tcp_addr = \"127.0.0.1:{}\"\nws_addr = \"127.0.0.1:{}\"\ndata_dir = \"{}\"\nevent_log_max = 100000\n\
+             \n\
+             [auth]\n\
+             jwt_secret = \"{SECRET}\"\n\
+             \n\
+             [[auth.acl]]\n\
+             role = \"*\"\n\
+             publish = [\"#\"]\n\
+             subscribe = [\"#\"]\n",
             self.tcp_port, ws_port, data_dir_literal
         );
         std::fs::write(&self.cfg_path, cfg).expect("write broker config");
@@ -90,7 +108,7 @@ impl Drop for Broker {
     }
 }
 
-fn connect_packet(client_id: &str, clean_start: bool) -> Connect {
+fn connect_packet(client_id: &str, clean_start: bool, token: &str) -> Connect {
     Connect {
         clean_start,
         keep_alive: 0,
@@ -106,7 +124,7 @@ fn connect_packet(client_id: &str, clean_start: bool) -> Connect {
         last_will: None,
         client_id: client_id.into(),
         username: None,
-        password: None,
+        password: Some(Bytes::from(token.to_string())),
         cert: None,
     }
 }
@@ -134,7 +152,7 @@ async fn connect(addr: &str, client_id: &str, clean_start: bool) -> Client {
     };
     let mut framed = Framed::new(stream, Codec::new(256 * 1024, 0));
     framed
-        .send(Packet::from(connect_packet(client_id, clean_start)))
+        .send(Packet::from(connect_packet(client_id, clean_start, &jwt(client_id, &["*"]))))
         .await
         .expect("send CONNECT");
     match next_packet(&mut framed).await {
