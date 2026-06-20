@@ -6,7 +6,9 @@ use std::process::{Child, Command};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rmqtt_codec::v5::{Codec, Connect, Packet};
 use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
@@ -18,6 +20,14 @@ use tokio_util::codec::Framed;
 const TCP_PORT: u16 = 21901;
 const WS_PORT: u16 = 28101;
 const TLS_PORT: u16 = 21902;
+const SECRET: &str = "e2e-tls-secret";
+const EXP: i64 = 4_102_444_800;
+
+fn jwt(sub: &str, roles: &[&str]) -> String {
+    let claims = serde_json::json!({ "sub": sub, "roles": roles, "exp": EXP });
+    encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(SECRET.as_bytes()))
+        .expect("encode jwt")
+}
 
 struct ChildGuard(Child);
 impl Drop for ChildGuard {
@@ -29,7 +39,7 @@ impl Drop for ChildGuard {
 
 type Client = Framed<TlsStream<TcpStream>, Codec>;
 
-fn connect_packet(client_id: &str) -> Connect {
+fn connect_packet(client_id: &str, token: &str) -> Connect {
     Connect {
         clean_start: true,
         keep_alive: 0,
@@ -45,7 +55,7 @@ fn connect_packet(client_id: &str) -> Connect {
         last_will: None,
         client_id: client_id.into(),
         username: None,
-        password: None,
+        password: Some(Bytes::from(token.to_string())),
         cert: None,
     }
 }
@@ -69,7 +79,15 @@ async fn mqtts_handshake_over_tls() {
         &cfg,
         format!(
             "tcp_addr = \"127.0.0.1:{TCP_PORT}\"\nws_addr = \"127.0.0.1:{WS_PORT}\"\n\
-             tls_addr = \"127.0.0.1:{TLS_PORT}\"\ntls_cert = '{}'\ntls_key = '{}'\n",
+             tls_addr = \"127.0.0.1:{TLS_PORT}\"\ntls_cert = '{}'\ntls_key = '{}'\n\
+             \n\
+             [auth]\n\
+             jwt_secret = \"{SECRET}\"\n\
+             \n\
+             [[auth.acl]]\n\
+             role = \"*\"\n\
+             publish = [\"#\"]\n\
+             subscribe = [\"#\"]\n",
             cert_path.display(),
             key_path.display()
         ),
@@ -112,7 +130,7 @@ async fn mqtts_handshake_over_tls() {
     };
 
     framed
-        .send(Packet::from(connect_packet("secure-client")))
+        .send(Packet::from(connect_packet("secure-client", &jwt("secure-client", &["*"]))))
         .await
         .expect("send CONNECT over TLS");
 

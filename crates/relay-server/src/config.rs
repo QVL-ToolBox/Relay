@@ -1,85 +1,75 @@
-//! Daemon configuration, loaded from a TOML file (consistent with the rest of
-//! the QVL-ToolBox: AIGate, HealthServ, MasterEnv all use TOML).
-
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use crate::auth::AuthConfig;
 
-/// Top-level Relay configuration.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
 pub struct Config {
-    /// TCP listener for native MQTT clients (backs: Rust, Go, Java…).
+    #[serde(default = "default_tcp_addr")]
     pub tcp_addr: SocketAddr,
-    /// WebSocket listener for browser / mobile clients (MQTT-over-WebSocket).
+    #[serde(default = "default_ws_addr")]
     pub ws_addr: SocketAddr,
-    /// Directory for the on-disk store. When set, retained messages survive
-    /// restarts; when absent, Relay runs fully in-memory (V1 behaviour).
+    #[serde(default)]
     pub data_dir: Option<PathBuf>,
-    /// Total delivery attempts for an unacknowledged QoS 1/2 message before it is
-    /// dead-lettered (`1` = no retry, straight to DLQ on the first failure).
+    #[serde(default = "default_max_delivery_attempts")]
     pub max_delivery_attempts: u32,
-    /// Base back-off between redelivery attempts, in seconds (doubles each
-    /// attempt, capped at [`retry_max_secs`](Config::retry_max_secs)).
+    #[serde(default = "default_retry_base_secs")]
     pub retry_base_secs: u64,
-    /// Upper bound on the redelivery back-off, in seconds.
+    #[serde(default = "default_retry_max_secs")]
     pub retry_max_secs: u64,
-    /// Maximum number of messages kept in the replayable event log (oldest are
-    /// pruned beyond this). `0` disables the event log (no replay). Requires
-    /// `data_dir`.
+    #[serde(default = "default_event_log_max")]
     pub event_log_max: u64,
-    /// Secure MQTT (mqtts) listener address. TLS is enabled only when this and
-    /// both `tls_cert` and `tls_key` are set.
+    #[serde(default)]
     pub tls_addr: Option<SocketAddr>,
-    /// PEM certificate chain for the mqtts listener.
+    #[serde(default)]
     pub tls_cert: Option<PathBuf>,
-    /// PEM private key for the mqtts listener.
+    #[serde(default)]
     pub tls_key: Option<PathBuf>,
-    /// Address of the embedded HTTP monitoring dashboard. Unset = disabled.
+    #[serde(default)]
     pub http_addr: Option<SocketAddr>,
-    /// Optional JWT authentication + topic ACL. Unset = open broker (legacy).
-    pub auth: Option<AuthConfig>,
+    pub auth: AuthConfig,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            // 1883 is the IANA-registered MQTT port; 8083 is the de-facto MQTT-over-WS port.
-            tcp_addr: "0.0.0.0:1883".parse().unwrap(),
-            ws_addr: "0.0.0.0:8083".parse().unwrap(),
-            data_dir: None,
-            max_delivery_attempts: 5,
-            retry_base_secs: 5,
-            retry_max_secs: 60,
-            event_log_max: 100_000,
-            tls_addr: None,
-            tls_cert: None,
-            tls_key: None,
-            http_addr: None,
-            auth: None,
-        }
-    }
+fn default_tcp_addr() -> SocketAddr {
+    "0.0.0.0:1883".parse().unwrap()
+}
+fn default_ws_addr() -> SocketAddr {
+    "0.0.0.0:8083".parse().unwrap()
+}
+fn default_max_delivery_attempts() -> u32 {
+    5
+}
+fn default_retry_base_secs() -> u64 {
+    5
+}
+fn default_retry_max_secs() -> u64 {
+    60
+}
+fn default_event_log_max() -> u64 {
+    100_000
 }
 
 impl Config {
-    /// Load configuration from a TOML file. Falls back to defaults if the file is absent.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
-        match std::fs::read_to_string(path) {
-            Ok(text) => Ok(toml::from_str(&text)?),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
-            Err(e) => Err(ConfigError::Io(e)),
-        }
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                ConfigError::Missing(path.to_path_buf())
+            } else {
+                ConfigError::Io(e)
+            }
+        })?;
+        Ok(toml::from_str(&text)?)
     }
 }
 
-/// Errors that can occur while loading configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    #[error("config file not found: {0} (an [auth] section is mandatory)")]
+    Missing(PathBuf),
     #[error("failed to read config file: {0}")]
-    Io(#[from] std::io::Error),
+    Io(std::io::Error),
     #[error("failed to parse config: {0}")]
     Parse(#[from] toml::de::Error),
 }

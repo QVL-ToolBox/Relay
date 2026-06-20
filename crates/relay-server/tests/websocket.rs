@@ -6,6 +6,7 @@
 
 use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rmqtt_codec::types::Publish;
 use rmqtt_codec::v5::{
     Codec, Connect, Packet, PublishProperties, QoS, Subscribe, SubscriptionOptions,
@@ -19,6 +20,14 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tokio_util::codec::{Decoder, Encoder};
 
 const TOPIC: &str = "ws/test/topic";
+const SECRET: &str = "e2e-ws-secret";
+const EXP: i64 = 4_102_444_800;
+
+fn jwt(sub: &str, roles: &[&str]) -> String {
+    let claims = serde_json::json!({ "sub": sub, "roles": roles, "exp": EXP });
+    encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(SECRET.as_bytes()))
+        .expect("encode jwt")
+}
 
 struct ChildGuard(Child);
 impl Drop for ChildGuard {
@@ -51,7 +60,7 @@ impl WsClient {
             codec: Codec::new(256 * 1024, 0),
             rbuf: BytesMut::new(),
         };
-        client.send(Packet::from(connect_packet(client_id))).await;
+        client.send(Packet::from(connect_packet(client_id, &jwt(client_id, &["*"])))).await;
         match client.recv().await {
             Packet::ConnectAck(_) => {}
             other => panic!("expected CONNACK, got {other:?}"),
@@ -84,7 +93,7 @@ impl WsClient {
     }
 }
 
-fn connect_packet(client_id: &str) -> Connect {
+fn connect_packet(client_id: &str, token: &str) -> Connect {
     Connect {
         clean_start: true,
         keep_alive: 0,
@@ -100,7 +109,7 @@ fn connect_packet(client_id: &str) -> Connect {
         last_will: None,
         client_id: client_id.into(),
         username: None,
-        password: None,
+        password: Some(Bytes::from(token.to_string())),
         cert: None,
     }
 }
@@ -113,7 +122,17 @@ async fn mqtt_over_websocket_routes_a_message() {
     let cfg = std::env::temp_dir().join("relay-ws-test.toml");
     std::fs::write(
         &cfg,
-        format!("tcp_addr = \"127.0.0.1:{tcp_port}\"\nws_addr = \"127.0.0.1:{ws_port}\"\n"),
+        format!(
+            "tcp_addr = \"127.0.0.1:{tcp_port}\"\nws_addr = \"127.0.0.1:{ws_port}\"\n\
+             \n\
+             [auth]\n\
+             jwt_secret = \"{SECRET}\"\n\
+             \n\
+             [[auth.acl]]\n\
+             role = \"*\"\n\
+             publish = [\"#\"]\n\
+             subscribe = [\"#\"]\n"
+        ),
     )
     .expect("write test config");
 
